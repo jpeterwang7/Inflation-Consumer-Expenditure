@@ -180,7 +180,79 @@ fig.update_xaxes(ticksuffix="%")
 fig.show(renderer="browser")
 
 #Figure 5: Essential vs. Non-essential goods
-    #Using historical
+    #Pull indexed CPI-U series by category from the BLS public API
+series = {
+    "All Items":    "CUUR0000SA0",
+    "Food at Home": "CUUR0000SAF11",
+    "Food Away":    "CUUR0000SEFV",
+    "Energy":       "CUUR0000SA0E",
+    "Shelter":      "CUUR0000SAH1",
+    "Medical Care": "CUUR0000SAM",
+    "Used Cars":    "CUUR0000SETA02",
+    "Apparel":      "CUUR0000SAA",
+    }
+
+payload = json.dumps({
+    "seriesid": list(series.values()),
+    "startyear": "2019",
+    "endyear": "2026",
+    })
+
+response = requests.post(
+    "https://api.bls.gov/publicAPI/v2/timeseries/data/",
+    data=payload,
+    headers={"Content-type": "application/json"}
+    )
+bls_data = response.json()
+
+    #Reshape the API response into a long dataframe
+id_to_name = {v: k for k, v in series.items()}
+records = []
+for s in bls_data["Results"]["series"]:
+    name = id_to_name[s["seriesID"]]
+    for obs in s["data"]:
+        if obs["value"] == "-":  #skip missing values
+            continue
+        records.append({
+            "category": name,
+            "year": int(obs["year"]),
+            "month": int(obs["period"].replace("M", "")),
+            "value": float(obs["value"]),
+            })
+
+df5 = pd.DataFrame(records)
+df5["date"] = pd.to_datetime(df5[["year", "month"]].assign(day=1))
+df5 = df5.sort_values(["category", "date"]).reset_index(drop=True)
+
+    #Index each category to January 2019 = 100 so categories are comparable
+base = df5[df5["date"] == "2019-01-01"].set_index("category")["value"]
+df5["indexed"] = df5.apply(lambda r: r["value"] / base[r["category"]] * 100, axis=1)
+
+    #Group categories into essential vs. nonessential goods
+group_map = {
+    "Food at Home": "Essential Goods",
+    "Energy":       "Essential Goods",
+    "Shelter":      "Essential Goods",
+    "Medical Care": "Essential Goods",
+    "Food Away":    "Nonessential Goods",
+    "Used Cars":    "Nonessential Goods",
+    "Apparel":      "Nonessential Goods",
+    "All Items":    "Overall Inflation",
+    }
+df5["group"] = df5["category"].map(group_map)
+
+    #Average the indexed values within each group, by month
+tableau_df = (
+    df5.groupby(["group", "date"])["indexed"]
+    .mean()
+    .reset_index()
+    .rename(columns={"group": "Category", "date": "Date", "indexed": "Index"})
+    )
+
+    #Export for Tableau — the essential vs. nonessential chart and the
+    #2026-2027 estimate bands are built in Tableau from this file
+tableau_df.to_csv("cpi_tableau.csv", index=False)
+print("Saved to cpi_tableau.csv")
 
 #Figure 6: ARIMA Model
     #Load and reshape data
