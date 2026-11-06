@@ -1,4 +1,6 @@
 #Import needed libraries
+import json
+import requests
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -8,14 +10,13 @@ import plotly.graph_objects as go
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
 from statsmodels.tsa.stattools import adfuller
-from sklearn.metrics import mean_squared_error
 
 #Consistent color pallete
 BLUE = "#2F5D8A"
 ORANGE = "#E8754F"
 
 #Figure 1: CPI line graph (Jan 2018 - Mar 2026)
-df1 = pd.read_csv("Jan_2018-Mar_2026.csv")
+df1 = pd.read_csv("Data/Jan_2018-Mar_2026.csv")
 df1["MonthYear"] = pd.to_datetime(df1["MonthYear"], format="%b %Y")
 df1["CPI_Value"] = pd.to_numeric(df1["CPI_Value"])
 
@@ -37,7 +38,7 @@ fig.update_layout(
 fig.show(renderer="browser")
 
 #Figure 2: Inflation Rate
-df2 = pd.read_csv("Jan_2018-Mar_2026.csv")
+df2 = pd.read_csv("Data/Jan_2018-Mar_2026.csv")
 df2["MonthYear"] = pd.to_datetime(df2["MonthYear"])
 df2["YoY Inflation"] = df2["CPI_Value"].pct_change(12) * 100 #inflation formula
 
@@ -62,7 +63,7 @@ fig.update_xaxes(dtick="M12",tickformat="%b %Y",tickangle=0)
 fig.show(renderer="browser")
 
 #Figure 3: Top 10 categories with largest price increases
-df3 = pd.read_excel("cpi_weighted.xlsx", header=None)
+df3 = pd.read_excel("Data/cpi_weighted.xlsx", header=None)
 df3 = df3.iloc[1:, [0, 1, 29]]
 df3.columns = ["level", "category", "YoY"]
 
@@ -103,7 +104,7 @@ fig.show(renderer="browser")
 # Figure 4: Lingering inflation
 
     #Selects rows and columns
-df4 = pd.read_excel("news-release-table2-202603.xlsx", header=None)
+df4 = pd.read_excel("Data/news-release-table2-202603.xlsx", header=None)
 df4 = df4.iloc[6:, [0, 1, 2, 3]]
 df4.columns = ["level", "category", "weight", "YoY"]
 
@@ -254,9 +255,9 @@ tableau_df = (
 tableau_df.to_csv("cpi_tableau.csv", index=False)
 print("Saved to cpi_tableau.csv")
 
-#Figure 6: ARIMA Model
+#Figure 6: Seasonal ARIMA forecast
     #Load and reshape data
-df = pd.read_excel("cpi_clean.xlsx").melt(
+df = pd.read_excel("Data/cpi_clean.xlsx").melt(
     id_vars="Year",
     var_name="Month",
     value_name="CPI"
@@ -275,72 +276,59 @@ df["Month"] = df["Month"].map(month_map)
 df["Time"] = pd.to_datetime(dict(year=df["Year"], month=df["Month"], day=1))
 df["CPI"] = pd.to_numeric(df["CPI"], errors="coerce")
 
-    #Cleaning data
-df = (df[["Time", "CPI"]].dropna().sort_values("Time"))
-    #Filtering dates and resetting index after
-df = df[df["Time"] >= "1990-01-01"].reset_index(drop=True)
+    #Monthly series from 1990 through the latest release
+    #Oct 2025 has no BLS release (government shutdown), so it stays a missing
+    #month that the model skips instead of treating Sep and Nov as back to back
+cpi = df.set_index("Time")["CPI"].sort_index()
+cpi = cpi["1990-01-01":cpi.last_valid_index()].asfreq("MS")
 
-
-    #80% Train/ 20% test split
-split = int(len(df) * 0.8)
-train = df.iloc[:split]
-test = df.iloc[split:]
+    #Model log CPI so monthly changes are percentage changes (inflation rates)
+log_cpi = np.log(cpi)
 
     #Check stationarity
-    #Difference the CPI series once to remove the long term upward trend
-diff = train["CPI"].diff().dropna()
+    #Difference log CPI once to remove the long term upward trend
+log_diff = log_cpi.diff().dropna()
 
     #Run the Augmented Dickey-Fuller test
     #A p-value below 0.05 suggests stationarity
-adf_pvalue = adfuller(diff)[1]
+adf_pvalue = adfuller(log_diff)[1]
 print("ADF p-value:", round(adf_pvalue, 4))
 
-    #Compare reasonable ARIMA models
-    #Define different combinations of (p, d, q) to test
-candidates = [
-    (1,1,1), (2,1,1), (3,1,1),
-    (4,1,1), (4,1,0), (3,1,2)
-    ]
-
-    #Fit and evaluate each ARIMA model
-results = []
-for order in candidates:
-    model = ARIMA(train["CPI"], order=order).fit()
-    pred = model.forecast(steps=len(test))
-    rmse = np.sqrt(mean_squared_error(test["CPI"], pred)) #Prediction error
-    results.append([order, model.aic, model.bic, rmse]) #storing results
-results = pd.DataFrame(results,columns=["ARIMA", "AIC", "BIC", "RMSE"])
-print(results.sort_values("RMSE").to_string(index=False))
-
-    #Select the ARIMA model with the lowest RMSE
-best_order = results.loc[results["RMSE"].idxmin(), "ARIMA"]
-print("\nSelected model:", best_order)
-
-    #Refit the selected model using the full CPI dataset
-final_model = ARIMA(df["CPI"], order=best_order).fit()
+    #Selected model: SARIMA(0,1,1)(1,0,1)12 with drift
+    #Chosen with a rolling backtest of six candidates (see arima_model_comparison.py)
+    #Drift = average monthly inflation, seasonal terms = month-of-year price pattern
+final_model = ARIMA(
+    log_cpi,
+    order=(0, 1, 1),
+    seasonal_order=(1, 0, 1, 12),
+    trend="t"
+    ).fit()
+print(final_model.summary())
 
 future_dates = pd.date_range(
-    df["Time"].max() + pd.offsets.MonthBegin(),
+    cpi.index.max() + pd.offsets.MonthBegin(),
     "2027-05-01",
     freq="MS"
     )
 
     #Forecast CPI for each future month
+    #Convert from log scale back to CPI points
 forecast = final_model.get_forecast(steps=len(future_dates))
-ci = forecast.conf_int()
+ci = np.exp(forecast.conf_int())
 forecast_df = pd.DataFrame({
     "Time": future_dates,
-    "Forecast": forecast.predicted_mean.values,
+    "Forecast": np.exp(forecast.predicted_mean.values),
     "Lower": ci.iloc[:, 0].values,
     "Upper": ci.iloc[:, 1].values
     })
+print(forecast_df.round(2).to_string(index=False))
 
 
     #Plot final forecast
-plot_df = df[df["Time"] >= "2018-01-01"]
+plot_df = cpi["2018-01-01":].dropna()
 fig = go.Figure()
 fig.add_scatter(
-    x=plot_df["Time"], y=plot_df["CPI"],
+    x=plot_df.index, y=plot_df.values,
     name="Actual CPI", line=dict(color=BLUE, width=4)
     )
 
@@ -362,7 +350,7 @@ fig.add_scatter(
     #Axis titles
 fig.update_layout(
     template="plotly_white",
-    title="<b>Where Are Prices Headed?</b><br><sup>ARIMA forecast of U.S. CPI through May 2027</sup>",
+    title="<b>Where Are Prices Headed?</b><br><sup>Seasonal ARIMA forecast of U.S. CPI through May 2027</sup>",
     yaxis_title="Consumer Price Index",
     legend=dict(orientation="h")
     )
